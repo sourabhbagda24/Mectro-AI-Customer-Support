@@ -82,12 +82,13 @@ Everything is orchestrated by plain, sequential Python (`app/orchestrator.py`) �
 
 | Layer | Technology | Why |
 |---|---|---|
-| LLM | **Groq** (`llama-3.3-70b-versatile`) | Fast, free-tier-friendly inference |
-| Agent framework | **LangChain** (`create_tool_calling_agent`, `AgentExecutor`, structured output) | Required by the assignment; no LangGraph |
+| LLM | **Groq** (`openai/gpt-oss-120b`, configurable via `GROQ_MODEL`) | Fast, free-tier-friendly inference. Originally built on LLaMA 3.3 70B; migrated after Groq retired it on 16 Aug 2026 |
+| Agent framework | **LangChain** (`bind_tools` tool calling, structured output) | Required by the assignment; no LangGraph |
 | Database | **MySQL** | Required by the assignment; stores policies and orders |
 | DB access | **SQLAlchemy** + **PyMySQL** | Safe, parameterised queries (no raw SQL from the LLM) |
 | API layer | **FastAPI** | Serves the pipeline as an HTTP endpoint |
-| Validation | **Pydantic** | Structured intent output + request/response schemas |
+| Validation | **Pydantic** | Structured intent output, tool input/output schemas, request/response schemas |
+| MCP server | **FastMCP** | Exposes the same 5 tools to any MCP client (Claude Desktop, Cursor, etc.) |
 | Config | **python-dotenv** | Keeps API keys and DB credentials out of source code |
 | Frontend | Plain **HTML/CSS/JS** (no framework) | Single file, zero build step, served directly by FastAPI |
 
@@ -100,13 +101,15 @@ support_system/
 ├── app/
 │   ├── main.py                    # FastAPI app: routes, CORS, serves the frontend
 │   ├── config.py                  # Loads .env into a Settings object
+│   ├── schemas.py                 # Pydantic models for tool inputs/outputs
+│   ├── mcp_server.py              # FastMCP server exposing the 5 tools
 │   ├── database.py                # SQLAlchemy engine + safe, parameterised DB queries
 │   ├── tools.py                   # LangChain @tool wrappers around database.py
 │   ├── orchestrator.py            # Runs the 3 agents in sequence
 │   ├── __init__.py
 │   └── agents/
 │       ├── intent_agent.py        # Agent 1 — Intent Detection
-│       ├── sql_agent.py           # Agent 2 — MySQL Database Agent
+│       ├── sql_agent.py           # Agent 2 — MySQL Database Agent (LLM tool calling)
 │       ├── response_agent.py      # Agent 3 — Response Generator
 │       └── __init__.py
 ├── static/
@@ -161,7 +164,7 @@ class IntentResult(BaseModel):
 It uses `llm.with_structured_output(IntentResult)` — the LLM's response is forced to match this schema, so downstream code never has to parse free-form text. This is the "Structured Outputs" requirement in practice.
 
 ### `app/agents/sql_agent.py` — **Agent 2**
-A real LangChain **tool-calling agent** (`create_tool_calling_agent` + `AgentExecutor`), given the 5 tools from `tools.py`. Its system prompt tells it exactly which tool to call for which intent (e.g. `refund_policy` → `get_refund_policy`, `order_status` → `get_order_details`). It calls **exactly one** tool per request and returns that tool's raw result.
+An **LLM tool-calling agent**: the Groq LLaMA 3.3 model is bound to the 5 tools from `tools.py` via `llm.bind_tools(TOOLS)` and decides which one to call (e.g. `refund_policy` → `get_refund_policy`, `order_status` → `get_order_details`). The requested tool calls are executed and their raw result is returned. If the model makes no valid tool call or the API fails, a deterministic intent → tool fallback keeps the pipeline working.
 
 ### `app/agents/response_agent.py` — **Agent 3**
 A simple LLM prompt chain (`prompt | llm | StrOutputParser`) that takes the original query, the detected intent, and the raw retrieved data, and writes a warm, professional customer-facing reply. It's explicitly instructed never to invent information that isn't in the retrieved data.
@@ -288,7 +291,7 @@ cp .env.example .env
 Edit `.env`:
 ```env
 GROQ_API_KEY=your_actual_groq_key
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 
 DB_HOST=localhost
 DB_PORT=3306
@@ -350,6 +353,39 @@ Then open:
 ```json
 { "status": "ok" }
 ```
+
+---
+
+## MCP server (FastMCP)
+
+The same 5 tools are also exposed through the Model Context Protocol using **FastMCP** (`app/mcp_server.py`), so any MCP client can query live order and policy data.
+
+```bash
+python -m app.mcp_server          # stdio transport (e.g. Claude Desktop)
+python -m app.mcp_server --http   # SSE transport on http://127.0.0.1:8001
+```
+
+Claude Desktop config example:
+
+```json
+{
+  "mcpServers": {
+    "mectro-support": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "cwd": "/path/to/Mectro-AI-Customer-Support"
+    }
+  }
+}
+```
+
+## Tests
+
+```bash
+pip install pytest
+pytest -q tests
+```
+Tests mock the database and the LLM, so no Groq key or MySQL is needed.
 
 ---
 
